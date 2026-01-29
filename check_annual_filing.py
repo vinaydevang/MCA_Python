@@ -1,6 +1,8 @@
 import sys
 import time
 import os
+import requests
+import pdfplumber
 from playwright.sync_api import sync_playwright
 import pandas as pd
 
@@ -67,7 +69,7 @@ def run():
                 ).or_(
                      target_frame.locator("text='Captcha match failed'")
                 ).or_(
-                     target_frame.locator("text='The captcha entered is incorrect'")
+                     target_frame.locator("*:has-text('The captcha entered is incorrect')")
                 )
 
                 try:
@@ -166,20 +168,56 @@ def run():
                                              submit_btn.click()
                                              print(" Clicked Submit (2nd time).")
                                              
-                                             # Wait for Error or Success
-                                             page.wait_for_timeout(3000) 
+                                             # Define success indicator early
+                                             success_indicator = target_frame.locator("#screenone").or_(
+                                                 target_frame.locator(".annual_filing_table")
+                                             ).or_(
+                                                 target_frame.locator("#annualFilingTable")
+                                             )
+
+                                             # Polling Loop for Result (Error or Success) - Up to 10 seconds
+                                             print(" Checking validation result (Polling)...")
+                                             validation_start_time = time.time()
+                                             validation_status = "unknown"
                                              
-                                             # Check error using the locally defined locator but scoped if needed or use general
-                                             if error_text_locator.count() > 0 and error_text_locator.first.is_visible():
-                                                  print(" FAILURE: Incorrect 2nd Captcha.")
-                                                  # Refresh logic
-                                                  active_modal.locator('#captchaRefresh').click()
-                                                  page.wait_for_timeout(3000) 
-                                                  continue
+                                             while time.time() - validation_start_time < 10:
+                                                 # Debug visibility
+                                                 err_count = error_text_locator.count()
+                                                 succ_count = success_indicator.count()
+                                                 
+                                                 # Check for Error first
+                                                 if err_count > 0:
+                                                     is_vis = error_text_locator.first.is_visible()
+                                                     if is_vis:
+                                                         print(f" DEBUG: Error found! Text: {error_text_locator.first.inner_text()}")
+                                                         print(" FAILURE: Incorrect 2nd Captcha.")
+                                                         validation_status = "error"
+                                                         # Refresh logic
+                                                         active_modal.locator('#captchaRefresh').click()
+                                                         page.wait_for_timeout(3000) 
+                                                         break # Break polling, continue outer retry loop
+                                                 
+                                                 # Check for Success
+                                                 if succ_count > 0:
+                                                     is_vis = success_indicator.first.is_visible()
+                                                     # print(f" DEBUG: Success indicator count={succ_count}, visible={is_vis}") # Too noisy?
+                                                     if is_vis:
+                                                         print(" SUCCESS: 2nd Captcha passed!")
+                                                         validation_status = "success"
+                                                         break # Break polling, break outer retry loop
+                                                 
+                                                 page.wait_for_timeout(500)
+                                             
+                                             if validation_status == "error":
+                                                 continue # Retry next attempt
+                                             elif validation_status == "success":
+                                                 break # Exit retry loop
                                              else:
-                                                  # Assume success if no error immediately found, loop exits
-                                                  print(" No error detected immediately. checking for results...")
-                                                  break
+                                                 print(" Timeout waiting for validation result. Assuming check failed or stuck.")
+                                                 # If we timed out without error or success, we might want to retry or just continue to final check
+                                                 # Let's try to scrape anyway or break if we think it failed.
+                                                 # For robustness, let's treat as 'unknown' and break to check final page.
+                                                 break
                                              
                                          else:
                                              print(" Canvas not found in second modal.")
@@ -193,7 +231,7 @@ def run():
                                      target_frame.locator("#annualFilingTable")
                                  )
                                  
-                                 success_indicator.wait_for(state="visible", timeout=20000)
+                                 success_indicator.wait_for(state="visible", timeout=60000)
                                  
                                  if success_indicator.count() > 0 and success_indicator.first.is_visible():
                                      print(" SUCCESS: Annual Filing History Page loaded!")
@@ -233,55 +271,125 @@ def run():
                                                  event_date = cells[2].inner_text()
                                                  
                                                  print(f" Row {i}: SRN={srn}, Form={form_name}, Date={event_date}")
+                                                
+                                                 # DEBUG: Print exact HTML of the Challan cell
+                                                 try:
+                                                     print(f" DEBUG: Cell[3] HTML: {cells[3].inner_html()}")
+                                                 except:
+                                                     print(" DEBUG: Could not print cell HTML")
+
+                                                 # Handle Direct Download
+                                                 challan_saved = False
+                                                 pdf_filename = f"{srn}.pdf"
+                                                 pdf_path = os.path.join("challan_pdfs", pdf_filename)
                                                  
+                                                 download_btn = cells[3].locator(".downloadDoc, img").first
+                                                 if download_btn.count() > 0:
+                                                     print(f" Found Download Button for {srn}. Clicking...")
+                                                     try:
+                                                         # Setup download handler
+                                                         with page.expect_download(timeout=30000) as download_info:
+                                                             download_btn.click()
+                                                         
+                                                         download = download_info.value
+                                                         # Save to specific path
+                                                         if not os.path.exists("challan_pdfs"): os.makedirs("challan_pdfs")
+                                                         download.save_as(pdf_path)
+                                                         print(f" Downloaded Challan to: {pdf_path}")
+                                                         challan_saved = True
+                                                     except Exception as e:
+                                                         print(f" Download failed for {srn}: {e}")
+                                                         challan_saved = False
+                                                 else:
+                                                     print(" No download button found.")
+                                                  
                                                  item = {
                                                      "SRN": srn,
-                                                     "Form Filed": form_name,
-                                                     "Filing Period": event_date,
-                                                     "Date of Filing": "N/A",
-                                                     "Amount Paid": "N/A",
-                                                     "Late Fee": "N/A"
+                                                     "Form Name": form_name,
+                                                     "Event Date": event_date,
+                                                     "PDF Path": pdf_path if challan_saved else "N/A"
                                                  }
                                                  
-                                                 # PROBE CHALLAN (Only for the first valid row for now to test)
-                                                 # Find link in 4th column (index 3)
-                                                 challan_link = cells[3].locator("a").first
-                                                 if challan_link.count() > 0:
-                                                     print(" Found Challan link. Clicking to probe...")
-                                                     
-                                                     # Check if it opens in new tab
-                                                     with context.expect_page() as new_page_info:
-                                                         challan_link.click()
-                                                     
-                                                     print(" Waiting for new page/tab...")
-                                                     challan_page = new_page_info.value
-                                                     challan_page.wait_for_load_state()
-                                                     print(f" Challan Page Loaded: {challan_page.url}")
-                                                     
-                                                     challan_page.wait_for_timeout(3000)
-                                                     challan_page.screenshot(path=f"{SCREENSHOTS_DIR}/challan_preview_{srn}.png")
-                                                     
-                                                     # Dump Challan HTML
-                                                     with open(f"{SCREENSHOTS_DIR}/debug_challan_{srn}.html", "w", encoding="utf-8") as f:
-                                                         f.write(challan_page.content())
-                                                     
-                                                     print(" Captured Challan debug info. Closing tab.")
-                                                     challan_page.close()
-                                                 else:
-                                                     print(" No Challan link found in this row.")
-                                                 
                                                  history_rows.append(item)
-                                                 
-                                                 # For this run, let's stop after 1 row to report back
-                                                 break 
+                                         
                                          
                                          print(f" Scraped {len(history_rows)} rows.")
                                          
-                                         # Save partial
+                                         # Save intermediate data WITH Challan URLs for standalone script
+                                         if history_rows:
+                                             df_temp = pd.DataFrame(history_rows)
+                                             df_temp.to_excel("annual_filing_with_urls.xlsx", index=False)
+                                             print(f" Saved intermediate data with Challan URLs to annual_filing_with_urls.xlsx")
+                                         
+                                         # Phase 2: Extract payment details from LOCAL PDFs
+                                         print("\n Phase 2: Extracting payment details from downloaded PDFs...")
+                                         
+                                         for i, row in enumerate(history_rows):
+                                             pdf_path = row.get('PDF Path', 'N/A')
+                                             srn = row['SRN']
+                                             
+                                             # Initialize with N/A defaults
+                                             row['Date of Filing'] = "N/A"
+                                             row['Amount Paid'] = "N/A"
+                                             row['Late Fee'] = "N/A"
+                                             
+                                             if pdf_path != "N/A" and os.path.exists(pdf_path):
+                                                 print(f" [{i+1}/{len(history_rows)}] Processing PDF for SRN {srn}...")
+                                                 
+                                                 try:
+                                                     # Extract text from PDF
+                                                     with pdfplumber.open(pdf_path) as pdf:
+                                                         text = ""
+                                                         for page_pdf in pdf.pages:
+                                                             text += page_pdf.extract_text() or ""
+                                                     
+                                                     # Parse text to find payment details
+                                                     lines = text.split('\n')
+                                                     
+                                                     for line in lines:
+                                                         # Find Service Request Date
+                                                         if 'Service Request Date' in line and ':' in line:
+                                                             parts = line.split(':', 1)
+                                                             if len(parts) == 2:
+                                                                 date_of_filing = parts[1].strip()
+                                                                 row['Date of Filing'] = date_of_filing
+                                                         
+                                                         # Find Total amount
+                                                         if 'Total' in line:
+                                                             # Extract numeric value from line
+                                                             parts = line.split()
+                                                             for part in reversed(parts):
+                                                                 if part.replace('.', '', 1).replace(',', '').isdigit():
+                                                                     row['Amount Paid'] = part
+                                                                     break
+                                                         
+                                                         # Find Additional (Late Fee)
+                                                         if 'Additional' in line:
+                                                             parts = line.split()
+                                                             for part in reversed(parts):
+                                                                 if part.replace('.', '', 1).replace(',', '').isdigit():
+                                                                     row['Late Fee'] = part
+                                                                     break
+                                                     
+                                                     # If no Additional fee found, set to 0.00
+                                                     if row['Late Fee'] == "N/A":
+                                                         row['Late Fee'] = "0.00"
+                                                     
+                                                     print(f"   Date: {row['Date of Filing']}, Amount: {row['Amount Paid']}, Late Fee: {row['Late Fee']}")
+                                                     
+                                                 except Exception as e:
+                                                     print(f"   Error parsing PDF {pdf_path}: {e}")
+                                             else:
+                                                 print(f"   Skipping {srn} (No PDF found)")
+                                         
+                                         # Save all rows with payment details
                                          if history_rows:
                                              df = pd.DataFrame(history_rows)
-                                             df.to_excel("annual_filing_details_partial.xlsx", index=False)
-                                             print(" Saved partial Excel.")
+                                             # Reorder columns (exclude Challan URL) - done AFTER Phase 2
+                                             column_order = ['SRN', 'Form Name', 'Event Date', 'Date of Filing', 'Amount Paid', 'Late Fee']
+                                             df = df[column_order]
+                                             df.to_excel("annual_filing_details.xlsx", index=False)
+                                             print(f"\n Saved {len(history_rows)} records with payment details to annual_filing_details.xlsx")
                                              
                                      except Exception as extract_e:
                                          print(f" Extraction Error: {extract_e}")

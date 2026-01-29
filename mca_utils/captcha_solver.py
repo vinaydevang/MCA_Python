@@ -12,7 +12,7 @@ from .utils import get_robust_locator
 
 
 
-def solve_captcha(frame, canvas_selector='#new-captcha-canvas, canvas', filename_prefix='captcha'):
+def solve_captcha(frame, canvas_selector='#new-captcha-canvas, canvas', filename_prefix='captcha', custom_params=None):
     """
     Solve CAPTCHA using 2Captcha service with robust retry logic.
     
@@ -20,6 +20,7 @@ def solve_captcha(frame, canvas_selector='#new-captcha-canvas, canvas', filename
         frame: Playwright frame object containing the CAPTCHA
         canvas_selector: CSS selector for the CAPTCHA canvas element
         filename_prefix: Prefix for screenshot filenames
+        custom_params: Optional dict to override default CAPTCHA_PARAMS
         
     Returns:
         Solved CAPTCHA text or empty string if failed
@@ -56,9 +57,14 @@ def solve_captcha(frame, canvas_selector='#new-captcha-canvas, canvas', filename
                 # Initialize solver with config
                 solver = TwoCaptcha(**CAPTCHA_CONFIG)
 
+                # Determine params to use
+                solve_params = CAPTCHA_PARAMS.copy()
+                if custom_params:
+                    solve_params.update(custom_params)
+
                 # Attempt to solve with strict parameters
-                print(f" DEBUG: calling solver with params: {CAPTCHA_PARAMS}")
-                result = solver.normal(jpg_filename, **CAPTCHA_PARAMS)
+                print(f" DEBUG: calling solver with params: {solve_params}")
+                result = solver.normal(jpg_filename, **solve_params)
                 print(f" DEBUG: Raw 2Captcha Response: {result}")
                 
                 if 'code' in result:
